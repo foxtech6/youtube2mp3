@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -145,24 +148,32 @@ func isValidYouTubeURL(url string) bool {
 	return false
 }
 
-// Завантаження відео через yt-dlp
+// Замініть функцію downloadVideo в bot.go
 func (b *Bot) downloadVideo(url string) (string, string, error) {
-	// Генеруємо унікальну назву файлу
 	filename := fmt.Sprintf("audio_%d", time.Now().Unix())
 	outputPath := fmt.Sprintf("/tmp/%s.%%(ext)s", filename)
 
-	// Команда yt-dlp для завантаження аудіо
+	// Покращена команда yt-dlp
 	cmd := exec.Command("yt-dlp",
 		"--extract-audio",
 		"--audio-format", "mp3",
-		"--audio-quality", "192K",
+		"--audio-quality", "192",
 		"--output", outputPath,
 		"--no-playlist",
+		"--quiet",
+		"--no-warnings",
+		"--ignore-errors",
 		url)
+
+	// Встановлюємо таймаут
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		// Додайте залежно від ОС
+	}
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", "", fmt.Errorf("помилка yt-dlp: %s", string(output))
+		logrus.Errorf("Помилка завантаження: %s", string(output))
+		return "", "", fmt.Errorf("не вдалося завантажити аудіо")
 	}
 
 	// Шукаємо створений файл
@@ -171,48 +182,73 @@ func (b *Bot) downloadVideo(url string) (string, string, error) {
 		return "", "", fmt.Errorf("файл не створено")
 	}
 
-	// Отримуємо назву відео з виводу yt-dlp
-	lines := strings.Split(string(output), "\n")
-	title := "Unknown"
-	for _, line := range lines {
-		if strings.Contains(line, "[download]") && strings.Contains(line, "Destination:") {
-			parts := strings.Split(line, "/")
-			if len(parts) > 0 {
-				lastPart := parts[len(parts)-1]
-				title = strings.TrimSuffix(lastPart, ".mp3")
-			}
-			break
-		}
-	}
+	// Отримуємо назву з файлу
+	title := extractTitleFromFilename(mp3File)
 
 	return mp3File, title, nil
 }
 
-// Отримання інформації про відео
+// Допоміжна функція для отримання назви
+func extractTitleFromFilename(filepath string) string {
+	base := path.Base(filepath)
+	name := strings.TrimSuffix(base, path.Ext(base))
+	// Очищуємо від timestamp
+	parts := strings.Split(name, "_")
+	if len(parts) > 1 {
+		return strings.Join(parts[1:], "_")
+	}
+	return name
+}
+
+// Замініть функцію getVideoInfo в bot.go
 func (b *Bot) getVideoInfo(url string) (string, int, error) {
+	// Спочатку перевіряємо доступність відео
 	cmd := exec.Command("yt-dlp",
-		"--get-title",
-		"--get-duration",
+		"--quiet",
+		"--no-warnings",
+		"--print", "%(title)s",
+		"--print", "%(duration)s",
+		"--print", "%(availability)s",
 		"--no-playlist",
 		url)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", 0, fmt.Errorf("помилка отримання інформації: %s", string(output))
+		logrus.Errorf("yt-dlp помилка: %s", string(output))
+		return "", 0, fmt.Errorf("відео недоступно або заблоковано")
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) < 2 {
-		return "", 0, fmt.Errorf("неповна інформація про відео")
+		return "", 0, fmt.Errorf("неможливо отримати інформацію про відео")
 	}
 
 	title := lines[0]
 	durationStr := lines[1]
 
-	// Парсимо тривалість (format: MM:SS або HH:MM:SS)
-	duration := parseDuration(durationStr)
+	// Перевіряємо доступність (якщо є третій рядок)
+	if len(lines) >= 3 && lines[2] != "public" {
+		return "", 0, fmt.Errorf("відео недоступно: %s", lines[2])
+	}
 
+	// Парсимо тривалість
+	duration := parseDuration(durationStr)
+	if duration == 0 {
+		// Пробуємо альтернативний спосіб
+		duration = parseDurationSeconds(durationStr)
+	}
+
+	logrus.Infof("Отримано інформацію: %s, тривалість: %d сек", title, duration)
 	return title, duration, nil
+}
+
+// Додайте цю функцію для парсингу секунд
+func parseDurationSeconds(durationStr string) int {
+	// Якщо тривалість в секундах (наприклад "212.5")
+	if seconds, err := strconv.ParseFloat(durationStr, 64); err == nil {
+		return int(seconds)
+	}
+	return 0
 }
 
 func parseDuration(durationStr string) int {
